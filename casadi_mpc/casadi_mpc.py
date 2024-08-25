@@ -72,8 +72,6 @@ class CasadiMPCNode(Node):
 
 
     def setup_mpc(self):
-        # TODO: Implement the setup_mpc function
-
         # CasADi symbols
         self.x = ca.SX.sym('x', 3)
         self.u = ca.SX.sym('u', 2)
