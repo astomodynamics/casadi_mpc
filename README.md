@@ -24,14 +24,14 @@ This package implements a Model Predictive Control (MPC) node using CasADi for o
 
 3. Install the required Python packages:
    ```
-   cd casadi_mpc_node
+   cd casadi_mpc
    pip install -r requirements.txt
    ```
 
 4. Build the ROS2 package:
    ```
    cd ~/ros2_ws
-   colcon build --packages-select casadi_mpc_node
+   colcon build --packages-select casadi_mpc
    ```
 
 5. Source the setup file:
@@ -43,20 +43,11 @@ This package implements a Model Predictive Control (MPC) node using CasADi for o
 
 1. Run the CasadiMPCNode:
    ```
-   ros2 run casadi_mpc casadi_mpc_node
+   ros2 run casadi_mpc casadi_mpc
    ```
 
-2. The node subscribes to the `/current_state` topic for state updates and publishes control inputs to the `/control_input` topic.
+2. The node subscribes to the `/robot_pose` topic for state updates, the `/goal_pose` topic for goal updates, and publishes control inputs to the `/cmd_vel` topic.
 
-3. To test, you can publish a state message:
-   ```
-   ros2 topic pub 
-   ```
-
-4. Monitor the control input:
-   ```
-   ros2 topic echo /control_input
-   ```
 
 ## Customization
 
