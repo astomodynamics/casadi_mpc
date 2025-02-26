@@ -57,7 +57,7 @@ class CasadiMPCNode(Node):
         self.state_sub = self.create_subscription(
             PoseStamped,
             # f'/{self.robot_id}/pose',
-            f'zed/zed_node/pose',
+            f'/zed/zed_node/pose',
             self.current_state_callback,
             10)
         
