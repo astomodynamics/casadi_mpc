@@ -41,6 +41,9 @@ class CasadiMPCNode(Node):
         self.current_state = ca.DM.zeros(3)
         self.goal_state = ca.DM.zeros(3)
 
+        self.is_current_pose_received = False
+        self.is_goal_pose_received = False
+
         # Define obstacle parameters:
         # Each obstacle is originally a square of side 0.41.
         # We use the circumscribed circle with radius = (0.41*sqrt(2))/2.
@@ -156,6 +159,7 @@ class CasadiMPCNode(Node):
         _, _, current_yaw = self.euler_from_quaternion(msg.pose.orientation)
 
         self.current_state = ca.DM([current_x, current_y, current_yaw]) 
+        self.is_current_pose_received = True
         self.get_logger().info(f'Received state update: x={current_x:.2f}, y={current_y:.2f}, theta={current_yaw:.2f}')
 
     def goal_state_callback(self, msg):
@@ -165,6 +169,7 @@ class CasadiMPCNode(Node):
         _, _, goal_yaw = self.euler_from_quaternion(msg.pose.orientation)
 
         self.goal_state = ca.DM([goal_x, goal_y, goal_yaw])
+        self.is_goal_pose_received = True
         self.get_logger().info(f'Received goal update: x={goal_x:.2f}, y={goal_y:.2f}, theta={goal_yaw:.2f}')
 
     def path_callback(self, msg):
@@ -193,6 +198,17 @@ class CasadiMPCNode(Node):
         return roll, pitch, yaw
     
     def control_callback(self):
+        # Check if pose and goal are received:
+        if not self.is_pose_received or not self.is_goal_pose_received:
+            self.get_logger().info(f'Current or Goal pose not received')
+            return
+
+        # If the robot reaches the goal, reset is_goal_received
+        if np.linalg.norm(self.current_state[:2] - self.goal_state[:2]) < 0.1:
+            self.is_goal_pose_received = False
+            self.get_logger().info(f'Reached goal. Goal pose reset')
+            return
+
         # Initialize guess trajectories for state and input over the horizon.
         x0 = np.zeros((3, self.horizon + 1))
         x0[:, 0] = np.array(self.current_state.full().flatten())
