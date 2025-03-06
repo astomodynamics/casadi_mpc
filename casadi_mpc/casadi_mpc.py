@@ -1,9 +1,11 @@
+#!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Path
 import numpy as np
 import casadi as ca
+import math
 
 class CasadiMPCNode(Node):
     def __init__(self):
@@ -14,63 +16,61 @@ class CasadiMPCNode(Node):
         self.robot_id = self.get_parameter("robot_id").value
 
         # MPC parameters
-        self.horizon = 20
-        self.dt = 0.1
+        self.horizon = 20       # MPC prediction horizon (number of control intervals)
+        self.dt = 0.1           # Discrete time step [s]
 
-        # State: [x, y, theta]
-        # Input: [v, omega]
+        # States: [x, y, theta] and Controls: [v, omega]
+        # Cost weights
+        self.Q = ca.diag([0.1, 0.1, 0.0])
+        self.R = ca.diag([0.01, 0.01])
+        self.Qf = ca.diag([0.0, 0.0, 0.0])  # Terminal cost weight
 
-        # Weights for the cost function 
-        self.Q = ca.diag([0.01, 0.01, 0.0])
-        self.R = ca.diag([0.1, 0.1])
-        self.Qf = ca.diag([1, 1, 0.0])
-
-        # Box constraints for state and inputs
-        self.x_min = 0
-        self.x_max = 10
-        self.y_min = 0
-        self.y_max = 10
+        # Box constraints for state and inputs.
+        self.x_min = -ca.inf
+        self.x_max = ca.inf
+        self.y_min = -ca.inf
+        self.y_max = ca.inf
         self.theta_min = -ca.pi
         self.theta_max = ca.pi
-        self.v_min = -1
-        self.v_max = 1
-        self.omega_min = -1
-        self.omega_max = 1
+        self.v_min = -1.0
+        self.v_max = 1.0
+        self.omega_min = -ca.pi
+        self.omega_max = ca.pi
 
-        # current state and goal state (3x1 DM vectors)
+        # Current state (initialized to zeros)
         self.current_state = ca.DM.zeros(3)
-        self.goal_state = ca.DM.zeros(3)
+
+        # Default goal state: [x, y, theta]
+        self.goal_state = ca.DM([2.0, 5.0, math.pi/2])
 
         self.is_current_pose_received = False
-        self.is_goal_pose_received = False
+        self.is_goal_pose_received = False # FIXME: if you want to use fixed goal, set this to True
 
-        # Define obstacle parameters:
-        # Each obstacle is originally a square of side 0.41.
-        # We use the circumscribed circle with radius = (0.41*sqrt(2))/2.
-        self.obstacle_centers = [(0.762, 2.54), (2.794, 3.429), (0.762, 4.318)]
+        # Obstacle parameters:
+        self.obstacle_centers = []
+        # FIXME: if you want to add obstacles, add them here, i.e.
+        # self.obstacle_centers = [(0.762, 2.54), (2.794, 3.429), (0.762, 4.318)]
         self.obstacle_radius = 0.41 * np.sqrt(2) / 2
 
-        # Setup optimization problem
+        # Set up the MPC problem formulation using CasADi.
         self.setup_mpc()
 
-        # ROS2 publishers and subscribers using robot_id in topic names
         self.state_sub = self.create_subscription(
             PoseStamped,
-            # f'/{self.robot_id}/pose',
-            f'/zed/zed_node/pose',
+            f'/{self.robot_id}/pose',
             self.current_state_callback,
-            10)
-        
-        self.goal_sub = self.create_subscription(
-            PoseStamped,
-            '/goal_pose',  # goal can remain on a global topic if desired
-            self.goal_state_callback,
             10)
         
         self.path_sub = self.create_subscription(
             Path,
-            f'/{self.robot_id}/path',
+            f'/{self.robot_id}/global_path',
             self.path_callback,
+            10)
+
+        self.goal_sub = self.create_subscription(
+            PoseStamped,
+            f'/{self.robot_id}/goal_pose',
+            self.goal_pose_callback,
             10)
 
         self.control_pub = self.create_publisher(
@@ -78,189 +78,236 @@ class CasadiMPCNode(Node):
             f'/{self.robot_id}/cmd_vel',
             10)
         
-        # Timer for continuous control in seconds
+        self.local_path_pub = self.create_publisher(
+            Path,
+            f'/{self.robot_id}/local_path',
+            10)
+
+        # Timer for continuous control (every 0.1 s)
         self.control_timer = self.create_timer(0.1, self.control_callback)
 
-        self.get_logger().info(f'CasadiMPCNode for robot_id "{self.robot_id}" has been initialized')
+        self.get_logger().info(
+            f'CasadiMPCNode for robot_id "{self.robot_id}" has been initialized with goal [2.0, 5.0, pi/2]'
+        )
 
     def setup_mpc(self):
-        # CasADi symbols for state and input
-        self.x = ca.SX.sym('x', 3)
-        self.u = ca.SX.sym('u', 2)
+        # ---------------------------------------------------------------------
+        # 1. Define Symbolic Variables for State and Control
+        # ---------------------------------------------------------------------
+        x = ca.SX.sym('x', 3)  # state: [x, y, theta]
+        u = ca.SX.sym('u', 2)  # control: [v, omega]
 
-        # Differential drive kinematics
-        x_dot = self.u[0] * ca.cos(self.x[2])
-        y_dot = self.u[0] * ca.sin(self.x[2])
-        theta_dot = self.u[1]
-        x_next = self.x + self.dt * ca.vertcat(x_dot, y_dot, theta_dot)
-        self.f = ca.Function('f', [self.x, self.u], [x_next])
+        # Continuous dynamics:
+        x_dot = ca.vertcat(u[0] * ca.cos(x[2]),
+                           u[0] * ca.sin(x[2]),
+                           u[1])
+        # Discrete-time dynamics via Euler integration:
+        x_next = x + self.dt * x_dot
+        f = ca.Function('f', [x, u], [x_next])
+        self.f = f
 
-        # Decision variables over the horizon:
-        # States: a 3 x (N+1) matrix, Inputs: a 2 x N matrix.
-        self.opt_x = ca.SX.sym('opt_x', 3, self.horizon + 1)
-        self.opt_u = ca.SX.sym('opt_u', 2, self.horizon)
+        # ---------------------------------------------------------------------
+        # 2. Define Decision Variables and Parameters
+        # ---------------------------------------------------------------------
+        X = ca.SX.sym('X', 3, self.horizon + 1)  # states at time steps 0,...,horizon
+        U = ca.SX.sym('U', 2, self.horizon)       # controls at time steps 0,...,horizon-1
+        self.X = X
+        self.U = U
 
-        # Parameters: initial state and reference (goal) state
-        self.p = ca.SX.sym('p', 3)   # initial state
-        self.ref = ca.SX.sym('ref', 3)  # goal state
+        # Parameters: initial state P and reference (goal) state ref.
+        P = ca.SX.sym('P', 3)
+        ref = ca.SX.sym('ref', 3)
+        self.P = P
+        self.ref = ref
 
-        # Cost function
-        obj = 0
+        # ---------------------------------------------------------------------
+        # 3. Build the Cost Function
+        # ---------------------------------------------------------------------
+        cost = 0
         for k in range(self.horizon):
-            state_error = self.opt_x[:, k] - self.ref
-            obj += ca.mtimes([state_error.T, self.Q, state_error]) + \
-                   ca.mtimes([self.opt_u[:, k].T, self.R, self.opt_u[:, k]])
-        # Terminal cost
-        state_error = self.opt_x[:, self.horizon] - self.ref
-        obj += ca.mtimes([state_error.T, self.Qf, state_error])
-        
-        # Constraints list
-        g = []
+            cost += ca.mtimes((X[:, k] - ref).T, ca.mtimes(self.Q, (X[:, k] - ref))) \
+                    + ca.mtimes(U[:, k].T, ca.mtimes(self.R, U[:, k]))
+        cost += ca.mtimes((X[:, self.horizon] - ref).T, ca.mtimes(self.Qf, (X[:, self.horizon] - ref)))
 
-        # Dynamics constraints: for each k, enforce x_{k+1} = f(x_k, u_k)
+        # ---------------------------------------------------------------------
+        # 4. Build the Constraints
+        # ---------------------------------------------------------------------
+        g_eq = []
+        # (a) Initial condition: X[:, 0] = P.
+        g_eq.append(X[:, 0] - P)
+        # (b) Dynamics constraints: for k = 0,...,horizon-1.
         for k in range(self.horizon):
-            g.append(self.opt_x[:, k+1] - self.f(self.opt_x[:, k], self.opt_u[:, k]))
-        
-        # Initial condition constraint
-        g.append(self.opt_x[:, 0] - self.p)
+            g_eq.append(X[:, k+1] - f(X[:, k], U[:, k]))
+        g_eq = ca.vertcat(*g_eq)
 
-        # Obstacle avoidance constraints:
-        # For every state along the horizon, ensure that the robot stays outside each obstacle.
-        # For each obstacle i and each time step k:
-        #     (x_k - x_obs_i)^2 + (y_k - y_obs_i)^2 - (obstacle_radius)^2 >= 0.
+        # (B) Obstacle avoidance constraints.
+        g_obs_list = []
         for k in range(self.horizon + 1):
-            xk = self.opt_x[0, k]
-            yk = self.opt_x[1, k]
             for (obs_x, obs_y) in self.obstacle_centers:
-                g.append((xk - obs_x)**2 + (yk - obs_y)**2 - self.obstacle_radius**2)
+                obs_constraint = (X[0, k] - obs_x)**2 + (X[1, k] - obs_y)**2 - self.obstacle_radius**2
+                g_obs_list.append(obs_constraint)
+        g_obs = ca.vertcat(*g_obs_list)
 
-        # Create the NLP problem dictionary.
-        # The decision variable vector is the vertical concatenation of opt_x and opt_u.
-        nlp = {'x': ca.vertcat(ca.reshape(self.opt_x, -1, 1), 
-                               ca.reshape(self.opt_u, -1, 1)),
-               'f': obj,
-               'g': ca.vertcat(*g),
-               'p': ca.vertcat(self.p, self.ref)}
+        # Combine constraints.
+        g_total = ca.vertcat(g_eq, g_obs)
+        self.g_total = g_total
 
-        opts = {'ipopt.print_level': 0, 'print_time': 0}
+        # ---------------------------------------------------------------------
+        # 5. Formulate the NLP
+        # ---------------------------------------------------------------------
+        Z = ca.vertcat(ca.reshape(X, -1, 1), ca.reshape(U, -1, 1))
+        self.Z = Z
+
+        # Parameter vector: [P; ref]
+        params = ca.vertcat(P, ref)
+        nlp = {'x': Z, 'f': cost, 'g': g_total, 'p': params}
+
+        opts = {
+            'ipopt.print_level': 0,
+            'ipopt.max_iter': 500,
+            'ipopt.tol': 1e-6,
+            'print_time': False
+        }
         self.solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
 
-        # Save the number of equality and inequality constraints for later use.
-        # Dynamics constraints: 3 per time step for horizon steps.
-        # Initial condition: 3 constraints.
-        self.eq_constr = 3 * self.horizon + 3
-        # Obstacle constraints: one per obstacle per time step.
-        self.ineq_constr = len(self.obstacle_centers) * (self.horizon + 1)
-    
+        # Save constraint dimensions for later use.
+        self.n_eq = 3 + 3 * self.horizon
+        self.n_obs = len(self.obstacle_centers) * (self.horizon + 1)
+
     def current_state_callback(self, msg):
-        # Extract current state (assuming PoseStamped with one pose)
         current_x = msg.pose.position.x 
         current_y = msg.pose.position.y
         _, _, current_yaw = self.euler_from_quaternion(msg.pose.orientation)
-
         self.current_state = ca.DM([current_x, current_y, current_yaw]) 
         self.is_current_pose_received = True
-        self.get_logger().info(f'Received state update: x={current_x:.2f}, y={current_y:.2f}, theta={current_yaw:.2f}')
-
-    def goal_state_callback(self, msg):
-        # Extract goal state (assuming PoseStamped with one pose)
-        goal_x = msg.pose.position.x
-        goal_y = msg.pose.position.y
-        _, _, goal_yaw = self.euler_from_quaternion(msg.pose.orientation)
-
-        self.goal_state = ca.DM([goal_x, goal_y, goal_yaw])
-        self.is_goal_pose_received = True
-        self.get_logger().info(f'Received goal update: x={goal_x:.2f}, y={goal_y:.2f}, theta={goal_yaw:.2f}')
+        self.get_logger().info(
+            f'Received state: x={current_x:.2f}, y={current_y:.2f}, theta={current_yaw:.2f}'
+        )
 
     def path_callback(self, msg):
         self.path = msg
-        # Extract the 2D path as a DM (if needed)
         self.ref_path = ca.DM([[pose.pose.position.x, pose.pose.position.y] for pose in msg.poses])
 
+    def goal_pose_callback(self, msg):
+        # Extract goal position and orientation.
+        goal_x = msg.pose.position.x
+        goal_y = msg.pose.position.y
+        _, _, goal_yaw = self.euler_from_quaternion(msg.pose.orientation)
+        self.goal_state = ca.DM([goal_x, goal_y, goal_yaw])
+        self.is_goal_pose_received = True
+        self.get_logger().info(
+            f'Updated goal state to: x={goal_x:.2f}, y={goal_y:.2f}, theta={goal_yaw:.2f}'
+        )
+
     def euler_from_quaternion(self, quaternion):
-        # Convert quaternion to Euler angles (roll, pitch, yaw)
         x = quaternion.x
         y = quaternion.y
         z = quaternion.z
         w = quaternion.w
-
         sinr_cosp = 2 * (w * x + y * z)
         cosr_cosp = 1 - 2 * (x * x + y * y)
         roll = np.arctan2(sinr_cosp, cosr_cosp)
-
         sinp = 2 * (w * y - z * x)
         pitch = np.arcsin(sinp)
-
         siny_cosp = 2 * (w * z + x * y)
         cosy_cosp = 1 - 2 * (y * y + z * z)
         yaw = np.arctan2(siny_cosp, cosy_cosp)
-
         return roll, pitch, yaw
     
     def control_callback(self):
         # Check if pose and goal are received:
-        if not self.is_pose_received or not self.is_goal_pose_received:
+        if not self.is_current_pose_received or not self.is_goal_pose_received:
             self.get_logger().info(f'Current or Goal pose not received')
             return
 
-        # If the robot reaches the goal, reset is_goal_received
-        if np.linalg.norm(self.current_state[:2] - self.goal_state[:2]) < 0.1:
+        # If the robot reaches the goal, reset is_goal_pose_received
+        if np.linalg.norm(self.current_state[:2] - self.goal_state[:2]) < 0.05:
+            # Return zero control
+            control_msg = Twist()
+            control_msg.linear.x = 0.0
+            control_msg.angular.z = 0.0
+            self.control_pub.publish(control_msg)
+
             self.is_goal_pose_received = False
             self.get_logger().info(f'Reached goal. Goal pose reset')
             return
+        
+        # 1. Create an Initial Guess for the Decision Variables.
+        x0_val = np.array(self.current_state.full().flatten())
+        goal_val = np.array(self.goal_state.full().flatten())
+        X0 = np.zeros((3, self.horizon + 1))
+        for i in range(3):
+            X0[i, :] = np.linspace(x0_val[i], goal_val[i], self.horizon + 1)
+        U0 = np.zeros((2, self.horizon))
+        Z0 = np.concatenate((X0.reshape(-1, order='F'), U0.reshape(-1, order='F')))
 
-        # Initialize guess trajectories for state and input over the horizon.
-        x0 = np.zeros((3, self.horizon + 1))
-        x0[:, 0] = np.array(self.current_state.full().flatten())
-        u0 = np.zeros((2, self.horizon))
+        # 2. Build Variable Bounds.
+        lbx_states = []
+        ubx_states = []
+        for _ in range(self.horizon + 1):
+            lbx_states.extend([self.x_min, self.y_min, self.theta_min])
+            ubx_states.extend([self.x_max, self.y_max, self.theta_max])
+        lbx_controls = []
+        ubx_controls = []
+        for _ in range(self.horizon):
+            lbx_controls.extend([self.v_min, self.omega_min])
+            ubx_controls.extend([self.v_max, self.omega_max])
+        lbx = lbx_states + lbx_controls
+        ubx = ubx_states + ubx_controls
 
-        # Construct the decision variable initial guess.
-        init_guess = ca.vertcat(ca.reshape(x0, -1, 1), ca.reshape(u0, -1, 1))
+        # 3. Build Constraint Bounds.
+        lbg_eq = [0.0] * self.n_eq
+        ubg_eq = [0.0] * self.n_eq
+        lbg_obs = [0.0] * self.n_obs
+        ubg_obs = [1e20] * self.n_obs
+        lbg_total = lbg_eq + lbg_obs
+        ubg_total = ubg_eq + ubg_obs
 
-        # Set bounds on decision variables.
-        # States: [x, y, theta] over horizon+1 steps.
-        lbx_states = [self.x_min, self.y_min, self.theta_min] * (self.horizon + 1)
-        ubx_states = [self.x_max, self.y_max, self.theta_max] * (self.horizon + 1)
-        # Inputs: [v, omega] over horizon steps.
-        lbx_inputs = [self.v_min, self.omega_min] * self.horizon
-        ubx_inputs = [self.v_max, self.omega_max] * self.horizon
-        lbx = ca.vertcat(*(lbx_states + lbx_inputs))
-        ubx = ca.vertcat(*(ubx_states + ubx_inputs))
-
-        # Build the lower and upper bounds for constraints.
-        # The first self.eq_constr constraints are equality (dynamics + initial condition): set to 0.
-        lbg_eq = [0] * self.eq_constr
-        ubg_eq = [0] * self.eq_constr
-        # The remaining self.ineq_constr constraints are the obstacle avoidance inequalities:
-        # They must be greater than or equal to 0.
-        lbg_ineq = [0] * self.ineq_constr
-        ubg_ineq = [ca.inf] * self.ineq_constr
-
-        lbg_all = ca.vertcat(*(lbg_eq + lbg_ineq))
-        ubg_all = ca.vertcat(*(ubg_eq + ubg_ineq))
-
-        # Solve the MPC problem.
-        res = self.solver(
-            x0=init_guess,
+        # 4. Solve the NLP.
+        p_val = np.concatenate((x0_val, goal_val))
+        sol = self.solver(
+            x0=Z0,
             lbx=lbx,
             ubx=ubx,
-            lbg=lbg_all,
-            ubg=ubg_all,
-            p=ca.vertcat(self.current_state, self.goal_state)
+            lbg=lbg_total,
+            ubg=ubg_total,
+            p=p_val
         )
-        
-        # Extract optimal control input (first control move).
-        sol = res['x']
-        # The control inputs are in the last 2*self.horizon entries.
-        u_opt = np.array(sol[-2*self.horizon:]).reshape(2, self.horizon)
-        
-        # Publish control input (linear and angular velocities).
+        Z_opt = sol['x'].full().flatten()
+
+        # Extract the state and control trajectories.
+        n_states = 3 * (self.horizon + 1)
+        X_opt = Z_opt[:n_states].reshape((3, self.horizon+1), order='F')
+        U_opt = Z_opt[n_states:].reshape((2, self.horizon), order='F')
+
+        # 5. Publish the First Control Input.
         control_msg = Twist()
-        control_msg.linear.x = float(u_opt[0, 0])
-        control_msg.angular.z = float(u_opt[1, 0])
+        control_msg.linear.x = float(U_opt[0, 0])
+        control_msg.angular.z = float(U_opt[1, 0])
         self.control_pub.publish(control_msg)
-        
-        self.get_logger().info(f'Published velocities: linear={u_opt[0, 0]:.2f}, angular={u_opt[1, 0]:.2f}')
+        self.get_logger().info(
+            f'Published velocities: linear={U_opt[0, 0]:.2f}, angular={U_opt[1, 0]:.2f}'
+        )
+
+        # 6. Publish the Predicted Local Path.
+        path_msg = Path()
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        path_msg.header.frame_id = "map"  # Adjust frame as needed
+        for i in range(self.horizon + 1):
+            pose_stamped = PoseStamped()
+            pose_stamped.header = path_msg.header
+            pose_stamped.pose.position.x = X_opt[0, i]
+            pose_stamped.pose.position.y = X_opt[1, i]
+            pose_stamped.pose.position.z = 0.0
+            theta = X_opt[2, i]
+            # Convert yaw to quaternion (assuming roll=pitch=0)
+            pose_stamped.pose.orientation.x = 0.0
+            pose_stamped.pose.orientation.y = 0.0
+            pose_stamped.pose.orientation.z = math.sin(theta/2.0)
+            pose_stamped.pose.orientation.w = math.cos(theta/2.0)
+            path_msg.poses.append(pose_stamped)
+        self.local_path_pub.publish(path_msg)
+        self.get_logger().info('Published local predicted path.')
 
 def main(args=None):
     rclpy.init(args=args)
