@@ -1,7 +1,8 @@
 # CasadiMPCNode ROS2 Package
 
 This package implements a Model Predictive Control (MPC) node using CasADi for optimization in a ROS2 environment.
-<img src="video/casadi_mpc_demo.gif" width="300" alt="">
+
+<img src="video/casadi_mpc_demo.gif" width="500" alt="">
 
 ## Prerequisites
 
