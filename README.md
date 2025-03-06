@@ -46,7 +46,7 @@ This package implements a Model Predictive Control (MPC) node using CasADi for o
    ros2 run casadi_mpc casadi_mpc
    ```
 
-2. The node subscribes to the `/robot_pose` topic for state updates, the `/goal_pose` topic for goal updates, and publishes control inputs to the `/cmd_vel` topic.
+2. The node subscribes to the `/robot_id/pose` topic for state updates, the `/robot_id/goal_pose` topic for goal updates, and publishes control inputs to the `/robot_id/cmd_vel` topic.
 
 
 ## Customization
